@@ -231,13 +231,8 @@ def load_pipeline(device):
 
     from photomaker.identity_slot_unet import IdentitySlotUNet
 
-    pipe.unet = IdentitySlotUNet(
-        pipe.unet,
-        down_strength=0.0,
-        mid_strength=0.0,
-        up_strength=0.2,
-        temperature=0.0
-    )
+    pipe.unet = IdentitySlotUNet(pipe.unet)
+    pipe.unet.disable_injection = True
 
 
     print("✅ UNet successfully wrapped.")
@@ -816,7 +811,7 @@ def main():
     # 🔥 Experiment toggles
     pipe.enable_routing = True          # disable attention routing
     pipe.enable_slot_injection = False    # keep additive slot injection
-
+    pipe.face_detector = face_detector
     try:
         images, used_seed = generate_image(pipe, face_detector, device)
         

@@ -72,6 +72,10 @@ from photomaker.identity_prompt_parser import extract_identity_prompt_map_clean
 from photomaker.identity_control_attn import SpatialRoutingProcessor
 from layered.masks import create_half_masks
 from photomaker.identity_slot_unet import IdentitySlotUNet
+from photomaker.feature_probing import extract_unet_face_feature
+from photomaker.insightface_package import analyze_faces
+
+
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
@@ -1448,38 +1452,21 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                     **extra_step_kwargs,
                     return_dict=False
                 )[0]
-
+                # 🔥 Synchronize streams
                 z_A = latents.clone()
                 z_B = latents.clone()
-                # --------------------------------------------------
-                # --------------------------------------------------
-                # 🔎 DEBUG IMAGE AT start_merge_step + MID PHASE
-                # 🔬 Identity Similarity-Based Bounding Box (UNet space)
-                # --------------------------------------------------
+                
+                
+                mid_step = int(num_inference_steps * 0.8)
 
-                mid_step = int(num_inference_steps * 0.5)
+                if i == mid_step:
 
-                if i == start_merge_step or i == mid_step:
+                    print(f"\n🧪 MID STEP DEBUG — step {i}")
 
-                    phase_name = (
-                        "start_merge_step"
-                        if i == start_merge_step
-                        else "mid_phase"
-                    )
-
-                    print(f"\n🧪 Decoding image at {phase_name} = {i}")
-
+                    # Decode latents
                     debug_latents = latents.clone()
 
-                    # -----------------------------
-                    # Safe VAE decode
-                    # -----------------------------
-                    needs_upcasting = (
-                        self.vae.dtype == torch.float16
-                        and self.vae.config.force_upcast
-                    )
-
-                    if needs_upcasting:
+                    if self.vae.dtype == torch.float16 and self.vae.config.force_upcast:
                         self.upcast_vae()
                         debug_latents = debug_latents.to(
                             next(iter(self.vae.post_quant_conv.parameters())).dtype
@@ -1490,105 +1477,53 @@ class PhotoMakerStableDiffusionXLAdapterPipeline(StableDiffusionXLAdapterPipelin
                         return_dict=False
                     )[0]
 
-                    debug_images = self.image_processor.postprocess(
+                    debug_image = self.image_processor.postprocess(
                         decoded,
                         output_type="pil"
-                    )
+                    )[0]
 
-                    debug_image = debug_images[0]
+                    # Face detection
+                    img_array = np.array(debug_image)[:, :, ::-1]
+                    faces = analyze_faces(self.face_detector, img_array)
 
-                    # --------------------------------------------------
-                    # 🔬 GET ARGMAX IDENTITY SEGMENTATION
-                    # --------------------------------------------------
+                    from PIL import ImageDraw
+                    draw = ImageDraw.Draw(debug_image)
 
-                    import numpy as np
-                    from PIL import Image
-                    import torch.nn.functional as F
+                    for idx, face in enumerate(sorted(faces, key=lambda f: f.bbox[0])):
+                        x1, y1, x2, y2 = face.bbox
+                        draw.rectangle([x1, y1, x2, y2], outline="red", width=4)
+                        print(f"Face {idx} bbox:", face.bbox)
 
-                    if (
-                        hasattr(self.unet, "debug_similarity")
-                        and len(self.unet.debug_similarity) > 0
-                    ):
+                    # Feature extraction
+                    if hasattr(self.unet, "last_hidden_states"):
+                        hidden_states = self.unet.last_hidden_states
 
-                        similarity_entry = self.unet.debug_similarity[-1]
+                        face_features = extract_unet_face_feature(
+                            hidden_states=hidden_states,
+                            debug_image=debug_image,
+                            face_detector=self.face_detector,
+                            analyze_faces_fn=analyze_faces,
+                        )
 
-                        if "scores" not in similarity_entry:
-                            print("⚠️ No full score tensor found (check _inject logging).")
+                        print(f"Detected {len(face_features)} face embeddings.")
 
-                        else:
-                            scores = similarity_entry["scores"]  # [B, N, H, W]
+                        for idx, feat in enumerate(face_features):
+                            print(f"Face {idx} feature norm:",
+                                torch.norm(feat).item())
 
-                            # Remove batch dimension
-                            scores = scores[0]  # [N, H, W]
+                        if len(face_features) >= 2:
+                            cos = torch.nn.functional.cosine_similarity(
+                                face_features[0].unsqueeze(0),
+                                face_features[1].unsqueeze(0),
+                                dim=-1
+                            )
+                            print("🔎 Cosine similarity:", cos.item())
 
-                            if scores.shape[0] < 2:
-                                print("⚠️ Only one identity present — argmax segmentation meaningless.")
-                            else:
-                                # ---------------------------------
-                                # 1️⃣ Argmax over identities
-                                # ---------------------------------
-                                identity_map = torch.argmax(scores, dim=0)  # [H, W]
-
-                                # ---------------------------------
-                                # 2️⃣ Upsample to image resolution
-                                # ---------------------------------
-                                identity_map = identity_map.unsqueeze(0).unsqueeze(0).float()
-
-                                img_w, img_h = debug_image.size
-
-                                identity_map_up = F.interpolate(
-                                    identity_map,
-                                    size=(img_h, img_w),
-                                    mode="nearest"
-                                )[0, 0].long()  # [H_img, W_img]
-
-                                identity_np = identity_map_up.cpu().numpy()
-
-                                # ---------------------------------
-                                # 3️⃣ Define identity colors
-                                # ---------------------------------
-                                colors = [
-                                    (255, 0, 0),    # Identity 0 → Red
-                                    (0, 0, 255),    # Identity 1 → Blue
-                                    (0, 255, 0),    # Identity 2 → Green
-                                    (255, 255, 0),  # Identity 3 → Yellow
-                                ]
-
-                                overlay = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-
-                                num_ids = scores.shape[0]
-
-                                for i_id in range(min(num_ids, len(colors))):
-                                    overlay[identity_np == i_id] = colors[i_id]
-
-                                overlay_img = Image.fromarray(overlay)
-
-                                # ---------------------------------
-                                # 4️⃣ Blend overlay with decoded image
-                                # ---------------------------------
-                                debug_image = Image.blend(
-                                    debug_image.convert("RGBA"),
-                                    overlay_img.convert("RGBA"),
-                                    alpha=0.4
-                                )
-
-                                print("✅ Argmax identity segmentation generated")
-
-                    else:
-                        print("⚠️ No similarity map available from UNet")
-
-                    # --------------------------------------------------
-                    # Save
-                    # --------------------------------------------------
-
-                    debug_path = (
-                        f"/teamspace/studios/this_studio/PhotoMaker/Data/Output/"
-                        f"debug_{phase_name}_step_{i}.png"
-                    )
+                    debug_path = f"/teamspace/studios/this_studio/PhotoMaker/Data/Output/mid_step_{i}.png"
 
                     debug_image.save(debug_path)
 
-                    print("✅ Saved debug image:", debug_path)
+                    print(f"Saved debug image at: {debug_path}")
                 # --------------------------------------------------
                 # CALLBACK (MUST BE INSIDE LOOP)
                 # --------------------------------------------------
